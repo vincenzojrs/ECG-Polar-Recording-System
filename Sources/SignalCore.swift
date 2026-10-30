@@ -235,7 +235,7 @@ final class SessionWriter {
         let name = iso.string(from: Date(timeIntervalSince1970: Double(startNS)/1e9)).replacingOccurrences(of: ":", with: "-")
         directory = parent.appendingPathComponent("\(test ? "SYNTHETIC-" : "")PolarPAP-\(name)-\(UUID().uuidString.prefix(6))", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        metadata = ["schema_version": 1, "app_version": "0.1.8", "status": "recording", "synthetic": test,
+        metadata = ["schema_version": 1, "app_version": "0.2.0", "status": "recording", "synthetic": test,
             "start_unix_ns": String(startNS), "device_name": device, "device_id": deviceID,
             "time_zone": TimeZone.current.identifier, "utc_offset_at_start_s": TimeZone.current.secondsFromGMT(),
             "mac_clock_unix_anchor_ns": String(clock.unixAnchorNS), "mac_clock_uptime_anchor_ns": String(clock.uptimeAnchorNS),

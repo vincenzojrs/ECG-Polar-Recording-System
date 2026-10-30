@@ -17,8 +17,8 @@ cat > PolarPAP.app/Contents/Info.plist <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>PolarPAP</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
-<key>CFBundleShortVersionString</key><string>0.1.8</string>
-<key>CFBundleVersion</key><string>9</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>11</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSBluetoothAlwaysUsageDescription</key><string>PolarPAP connects to your Polar H10 to record ECG, heart rate and RR intervals locally on your Mac.</string>
