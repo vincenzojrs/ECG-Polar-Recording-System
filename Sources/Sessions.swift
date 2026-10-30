@@ -1,5 +1,17 @@
 import Foundation
 
+enum PlotWindowMath {
+    static func selected(offset: Double, visible: Double, total: Double, lower: Double, upper: Double) -> (Double, Double)? {
+        let width = visible > 0 ? visible : total
+        let lo = max(0, min(1, min(lower, upper)))
+        let hi = max(0, min(1, max(lower, upper)))
+        guard width > 1, hi > lo else { return nil }
+        let span = min(width, max(1, (hi - lo) * width))
+        let start = max(0, min(offset + lo * width, total - span))
+        return (start, span)
+    }
+}
+
 enum AppPage: String, CaseIterable, Identifiable {
     case record = "Record"
     case sessions = "Sessions"
@@ -140,11 +152,8 @@ enum SessionStore {
             let start = Date(timeIntervalSince1970: startNS / 1e9)
             let end = (json["end_unix_ns"] as? String).flatMap(Double.init).map { Date(timeIntervalSince1970: $0 / 1e9) }
             let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
-            let hrRows = files.filter { $0.lastPathComponent.hasSuffix("_hr.csv") }.flatMap { rows(url: $0) }
-            var totalHR = 0.0, hrCount = 0
-            for row in hrRows.dropFirst() where row.count > 2 {
-                if let value = Double(row[2]) { totalHR += value; hrCount += 1 }
-            }
+            let pulse = files.filter { $0.lastPathComponent.hasSuffix("_hr.csv") }.flatMap { parsePulse(rows(url: $0)) }
+            let totalHR = pulse.reduce(0.0) { $0 + $1.bpm }, hrCount = pulse.count
             let events = files.filter { $0.lastPathComponent.hasSuffix("_events.csv") }.flatMap { eventRows(url: $0) }
             let gaps = gapDurations(events)
             sessions.append(SavedSession(folder: folder, start: start, end: end, status: json["status"] as? String ?? "unknown",
@@ -160,17 +169,16 @@ enum SessionStore {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
             return SessionFileItem(url: url, bytes: size)
         }.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
-        let rrRows = contents.filter { $0.lastPathComponent.hasSuffix("_rr.csv") }.flatMap { rows(url: $0) }
+        let rrRows = contents.filter { $0.lastPathComponent.hasSuffix("_rr.csv") }.sorted { $0.lastPathComponent < $1.lastPathComponent }.flatMap { rows(url: $0).dropFirst() }
         var rr: [SessionRRPoint] = []
-        for row in rrRows.dropFirst() where row.count > 3 {
+        for row in rrRows where row.count > 3 {
             if let ns = Double(row[0]), let ms = Double(row[3]) { rr.append(SessionRRPoint(time: Date(timeIntervalSince1970: ns/1e9), milliseconds: ms)) }
         }
-        let hrvRows = contents.filter { $0.lastPathComponent.hasSuffix("_hrv.csv") }.flatMap { rows(url: $0) }
-        let hrv = parseHRV(hrvRows)
+        rr.sort { $0.time < $1.time }
+        let hrv = contents.filter { $0.lastPathComponent.hasSuffix("_hrv.csv") }.flatMap { parseHRV(rows(url: $0)) }.sorted { $0.start < $1.start }
         let ecgFiles = contents.filter { $0.lastPathComponent.hasSuffix("_ecg.csv") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
         let ecg = sampledECG(files: ecgFiles)
-        let hrRows = contents.filter { $0.lastPathComponent.hasSuffix("_hr.csv") }.flatMap { rows(url: $0) }
-        let pulseRate = parsePulse(hrRows)
+        let pulseRate = contents.filter { $0.lastPathComponent.hasSuffix("_hr.csv") }.flatMap { parsePulse(rows(url: $0)) }.sorted { $0.time < $1.time }
         let events = contents.filter { $0.lastPathComponent.hasSuffix("_events.csv") }.flatMap { eventRows(url: $0) }.sorted { $0.time < $1.time }
         return SessionDetail(summary: summary, rr: rr, ecg: ecg, pulseRate: pulseRate, hrv: hrv, events: events, files: files)
     }
@@ -201,29 +209,87 @@ enum SessionStore {
         }
     }
 
-    // Cap plotted points per display segment so overnight ECG stays responsive while preserving the visible waveform envelope.
+    // ECG rows are numeric and never contain quoted or multiline fields.
+    // Iterate in bounded chunks, including a final line without a newline.
+    private static func eachECGLine(_ url: URL, _ body: (String) throws -> Bool) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var pending = Data()
+        while true {
+            let chunk = try handle.read(upToCount: 262_144) ?? Data()
+            pending.append(chunk)
+            var start = pending.startIndex
+            while let newline = pending[start...].firstIndex(of: 10) {
+                if let line = String(data: pending[start..<newline], encoding: .utf8), try !body(line.trimmingCharacters(in: .newlines)) { return }
+                start = pending.index(after: newline)
+            }
+            if start != pending.startIndex { pending.removeSubrange(pending.startIndex..<start) }
+            if chunk.isEmpty {
+                if !pending.isEmpty, let line = String(data: pending, encoding: .utf8) { _ = try body(line.trimmingCharacters(in: .newlines)) }
+                return
+            }
+        }
+    }
+
+    // Read original samples in a short interval without loading the whole night into memory.
+    static func ecgWindow(folder: URL, start: Date, duration: TimeInterval = 10) throws -> [SessionECGPoint] {
+        let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasSuffix("_ecg.csv") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let end = start.addingTimeInterval(duration)
+        var result: [SessionECGPoint] = []
+        for url in files {
+            var ti: Int?, vi: Int?
+            try eachECGLine(url) { line in
+                let fields = line.components(separatedBy: ",")
+                if ti == nil {
+                    guard let t = fields.firstIndex(of: "timestamp_unix_ns"), let v = fields.firstIndex(of: "ecg_mv") else { throw CocoaError(.fileReadCorruptFile) }
+                    ti = t; vi = v; return true
+                }
+                guard let ti, let vi, max(ti, vi) < fields.count, let ns = Double(fields[ti]), let mv = Double(fields[vi]) else { return true }
+                let time = Date(timeIntervalSince1970: ns / 1e9)
+                // Continue through all files: rotated files can overlap in time.
+                if time >= start && time < end { result.append(SessionECGPoint(time: time, millivolts: mv)) }
+                return time < end
+            }
+        }
+        return result.sorted { $0.time < $1.time }
+    }
+
+    // Downsample for the overview; never use these points as an ECG waveform.
     private static func sampledECG(files: [URL], maximumPoints: Int = 120_000) -> [SessionECGPoint] {
-        let headers = files.compactMap { url -> (URL, [String])? in rows(url: url).first.map { (url, $0) } }
-        let total = headers.reduce(0) { total, item in total + max(0, lineCount(item.0) - 1) }
+        let total = files.reduce(0) { $0 + max(0, lineCount($1) - 1) }
         guard total > 0 else { return [] }
         let stride = max(1, Int(ceil(Double(total) / Double(maximumPoints))))
         var result: [SessionECGPoint] = [], globalIndex = 0
-        for (url, header) in headers {
-            let indices = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
-            guard let ti = indices["timestamp_unix_ns"], let vi = indices["ecg_mv"], let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            let parsed = parseCSV(text)
-            for row in parsed.dropFirst() {
+        for url in files {
+            var ti: Int?, vi: Int?
+            try? eachECGLine(url) { line in
+                if ti == nil {
+                    let fields = line.components(separatedBy: ",")
+                    ti = fields.firstIndex(of: "timestamp_unix_ns")
+                    vi = fields.firstIndex(of: "ecg_mv")
+                    return ti != nil && vi != nil
+                }
                 defer { globalIndex += 1 }
-                guard globalIndex % stride == 0, max(ti, vi) < row.count, let ns = Double(row[ti]), let mv = Double(row[vi]) else { continue }
+                guard globalIndex % stride == 0, let ti, let vi else { return true }
+                let fields = line.components(separatedBy: ",")
+                guard max(ti, vi) < fields.count, let ns = Double(fields[ti]), let mv = Double(fields[vi]) else { return true }
                 result.append(SessionECGPoint(time: Date(timeIntervalSince1970: ns / 1e9), millivolts: mv))
+                return true
             }
         }
-        return result
+        return result.sorted { $0.time < $1.time }
     }
 
     private static func lineCount(_ url: URL) -> Int {
-        guard let data = try? Data(contentsOf: url) else { return 0 }
-        return data.reduce(0) { $1 == 10 ? $0 + 1 : $0 } + (data.last == 10 ? 0 : 1)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return 0 }
+        defer { try? handle.close() }
+        var count = 0, last: UInt8?
+        while let chunk = try? handle.read(upToCount: 262_144), !chunk.isEmpty {
+            count += chunk.reduce(0) { $1 == 10 ? $0 + 1 : $0 }
+            last = chunk.last
+        }
+        return count + (last == nil || last == 10 ? 0 : 1)
     }
 
     private static func rows(url: URL) -> [[String]] {

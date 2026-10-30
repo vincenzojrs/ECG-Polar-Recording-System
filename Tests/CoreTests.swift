@@ -11,6 +11,11 @@ import Foundation
         do { try f(); fatalError("Expected error: \(name)") } catch { assertions += 1 }
     }
     static func main() throws {
+        let firstZoom = PlotWindowMath.selected(offset: 0, visible: 0, total: 3600, lower: 0.25, upper: 0.5)
+        check(firstZoom != nil && abs(firstZoom!.0 - 900) < 0.001 && abs(firstZoom!.1 - 900) < 0.001, "drag zoom maps the night to the selected time")
+        let nestedZoom = PlotWindowMath.selected(offset: 900, visible: 900, total: 3600, lower: 0.8, upper: 0.2)
+        check(nestedZoom != nil && abs(nestedZoom!.0 - 1080) < 0.001 && abs(nestedZoom!.1 - 540) < 0.001, "reverse drag and nested zoom use the current time window")
+        check(PlotWindowMath.selected(offset: 0, visible: 0, total: 3600, lower: 0.5, upper: 0.5) == nil, "empty drag does not zoom")
         let hr = try HRPacket.decode(Data([0x16,60, 0x00,0x04, 0x80,0x03]))
         check(hr.bpm == 60 && hr.contact == true && hr.rr == [1024,896], "HR contact + multiple RR")
         let wide = try HRPacket.decode(Data([0x19,0x2c,0x01,0xff,0,0,4]))
@@ -56,6 +61,22 @@ import Foundation
             "000_clock.csv": SessionWriter.headers["clock"]! + "\n\(testStart),2023-11-14T22:13:20.000Z,\(testStart),1234,600000000000,100,1\n"
         ]
         for (name, contents) in csvFixtures { try contents.write(to: sourceFolder.appendingPathComponent(name), atomically: true, encoding: .utf8) }
+        let later = testStart + 3_600_000_000_000
+        try (SessionWriter.headers["hr"]! + "\n\(later),time,80,true,1,test\n").write(to: sourceFolder.appendingPathComponent("001_hr.csv"), atomically: true, encoding: .utf8)
+        try (SessionWriter.headers["rr"]! + "\n\(later),time,1024,1000,80,\(later),true,true,test,1,test\n").write(to: sourceFolder.appendingPathComponent("001_rr.csv"), atomically: true, encoding: .utf8)
+        let laterHRV = csvFixtures["000_hrv.csv"]!.replacingOccurrences(of: String(testStart), with: String(later)).replacingOccurrences(of: String(testStart+300_000_000_000), with: String(later+300_000_000_000))
+        try laterHRV.write(to: sourceFolder.appendingPathComponent("001_hrv.csv"), atomically: true, encoding: .utf8)
+        try (SessionWriter.headers["ecg"]! + "\n\(later),time,600000000000,25,0.025,\(later),1,test").write(to: sourceFolder.appendingPathComponent("001_ecg.csv"), atomically: true, encoding: .utf8)
+        let summaries = try SessionStore.scan(root: shiftRoot)
+        let detail = try SessionStore.detail(for: summaries[0])
+        check(detail.pulseRate.count == 2 && detail.pulseRate[0].bpm == 60 && detail.pulseRate[1].bpm == 80, "rotated heart-rate files are parsed and sorted")
+        near(summaries[0].meanHR, 70, "mean heart rate includes each rotated file")
+        check(detail.rr.count == 2 && detail.rr[0].time < detail.rr[1].time, "rotated RR files are sorted")
+        check(detail.hrv.count == 2 && detail.hrv[0].start < detail.hrv[1].start, "rotated HRV files are parsed and sorted")
+        let rawWindow = try SessionStore.ecgWindow(folder: sourceFolder, start: Date(timeIntervalSince1970: Double(testStart)/1e9))
+        check(rawWindow.count == 1 && rawWindow[0].millivolts == 0.01, "ECG window reads original samples")
+        let laterWindow = try SessionStore.ecgWindow(folder: sourceFolder, start: Date(timeIntervalSince1970: Double(later)/1e9))
+        check(laterWindow.count == 1 && laterWindow[0].millivolts == 0.025, "ECG window reads a final line without newline across rotated files")
         let createdBeforeShift = Int64((Date().timeIntervalSince1970 * 1e9).rounded())
         let shiftedFolder = try TimeShiftProcessor.createShiftedCopy(source: sourceFolder, targetStart: Date(timeIntervalSince1970: 1_700_003_600))
         let createdAfterShift = Int64((Date().timeIntervalSince1970 * 1e9).rounded())

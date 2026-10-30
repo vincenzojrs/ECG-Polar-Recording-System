@@ -1,4 +1,6 @@
 import SwiftUI
+
+private typealias PolarPlotState<Value> = SwiftUI.State<Value>
 import AppKit
 
 private enum PAPStyle {
@@ -60,7 +62,7 @@ private struct AppSidebar: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Stored on this Mac", systemImage: "lock")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
-                Text("Version 0.1.8").font(.system(size: 12)).foregroundStyle(.tertiary)
+                Text("Version 0.2.0").font(.system(size: 12)).foregroundStyle(.tertiary)
             }.padding(.horizontal, 18).padding(.bottom, 18)
         }
         .background(Color(nsColor: .underPageBackgroundColor))
@@ -318,7 +320,7 @@ private struct SessionDetailPage: View {
                 if r.sessionsLoading { ProgressView("Loading session…").frame(maxWidth:.infinity,minHeight:260) }
                 else if let detail = r.selectedSessionDetail {
                     switch r.sessionTab {
-                    case .overview: SessionOverview(detail: detail, chart: $r.sessionChart, mode: $r.hrvDisplayMode)
+                    case .overview: SessionOverview(detail: detail, chart: $r.sessionChart, mode: $r.hrvDisplayMode).id(detail.summary.id)
                     case .files: SessionFiles(detail: detail)
                     case .events: SessionEvents(detail: detail, zone: summary.timeZone)
                     }
@@ -344,6 +346,19 @@ private struct SessionOverview: View {
     let detail: SessionDetail
     @Binding var chart: SessionChart
     @Binding var mode: HRVDisplayMode
+    @PolarPlotState private var requestedSpan = 0
+    @PolarPlotState private var requestedOffset: Double = 0
+    @PolarPlotState private var visibleOffset: Double = 0
+    @PolarPlotState private var visibleSpan: Double = 0
+    @PolarPlotState private var ecgWindow: [SessionECGPoint] = []
+    @PolarPlotState private var ecgWindowStart: Date?
+    @PolarPlotState private var ecgLoading = false
+    @PolarPlotState private var ecgError: String?
+    @PolarPlotState private var requestID = 0
+    @PolarPlotState private var zoomHistory: [(Double, Double)] = []
+    private var windowStart: Date { detail.summary.start.addingTimeInterval(visibleOffset) }
+    private var windowEnd: Date { windowStart.addingTimeInterval(visibleSpan > 0 ? visibleSpan : detail.summary.duration) }
+    private func inWindow(_ time: Date) -> Bool { time >= windowStart && time <= windowEnd }
     private var activeWindow: SessionHRVRow? { detail.hrv.first(where: { $0.usable }) ?? detail.hrv.first }
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
@@ -355,6 +370,7 @@ private struct SessionOverview: View {
                             .pickerStyle(.segmented).frame(maxWidth: 520)
                         Spacer()
                     }
+                    navigationControls
                     selectedChart
                 }
             }
@@ -388,30 +404,122 @@ private struct SessionOverview: View {
                     } else { Text("No HRV windows in this session.").font(.system(size:13)).foregroundStyle(.secondary) }
                 }
             } }
+        }.onChange(of: chart) { selection in
+            if selection == .ecg && !ecgLoading && ecgWindowStart != windowStart && visibleSpan > 0 && visibleSpan <= 30 { loadECGWindow() }
         }
+    }
+    private var navigationControls: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("Time range").font(.system(size: 12, weight: .medium))
+                Picker("Time range", selection: $requestedSpan) {
+                    Text("Whole session").tag(0); Text("1 hour").tag(3600)
+                    Text("5 minutes").tag(300); Text("30 seconds").tag(30); Text("10 seconds").tag(10)
+                    Text("Custom selection").tag(-1)
+                }.labelsHidden().frame(width: 150)
+                Button("Apply") { applyWindow() }
+                Button("◀") { moveWindow(-1) }.disabled(visibleSpan == 0 || visibleOffset <= 0).help("Previous window")
+                Button("▶") { moveWindow(1) }.disabled(visibleSpan == 0 || visibleOffset + visibleSpan >= detail.summary.duration).help("Next window")
+                Button("Back") { zoomBack() }.disabled(zoomHistory.isEmpty)
+                Button("Whole session") { showWholeSession() }
+                if ecgLoading { ProgressView().controlSize(.small) }
+                Spacer()
+            }
+            Slider(value: $requestedOffset, in: 0...max(1, detail.summary.duration - (visibleSpan > 0 ? visibleSpan : detail.summary.duration)), onEditingChanged: { editing in
+                if !editing && visibleSpan > 0 { setWindow(offset: requestedOffset, span: visibleSpan) }
+            }).disabled(visibleSpan == 0)
+            HStack {
+                Text("Drag on the chart to zoom · right-click for options")
+                Spacer()
+                Text("Showing \(dateText(windowStart, zone: detail.summary.timeZone, includeDate: false))–\(dateText(windowEnd, zone: detail.summary.timeZone, includeDate: false))")
+            }.font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+    private func setWindow(offset: Double, span: Double) {
+        let total = max(0, detail.summary.duration)
+        visibleSpan = span <= 0 || span >= total ? 0 : max(1, span)
+        visibleOffset = visibleSpan == 0 ? 0 : max(0, min(offset, total - visibleSpan))
+        requestedOffset = visibleOffset
+        if visibleSpan == 0 { requestedSpan = 0 }
+        else if [10, 30, 300, 3600].contains(Int(visibleSpan)) && abs(visibleSpan - visibleSpan.rounded()) < 0.001 { requestedSpan = Int(visibleSpan) }
+        else { requestedSpan = -1 }
+        requestID += 1
+        ecgLoading = false; ecgWindowStart = nil; ecgError = nil
+        if chart == .ecg && visibleSpan > 0 && visibleSpan <= 30 { loadECGWindow() }
+    }
+    private func applyWindow() {
+        guard requestedSpan != -1 else { return }
+        zoomHistory.append((visibleOffset, visibleSpan))
+        setWindow(offset: visibleOffset, span: Double(requestedSpan))
+    }
+    private func moveWindow(_ direction: Double) {
+        guard visibleSpan > 0 else { return }
+        setWindow(offset: visibleOffset + direction * visibleSpan, span: visibleSpan)
+    }
+    private func zoomSelection(_ lower: Double, _ upper: Double) {
+        guard let selection = PlotWindowMath.selected(offset: visibleOffset, visible: visibleSpan, total: detail.summary.duration, lower: lower, upper: upper) else { return }
+        zoomHistory.append((visibleOffset, visibleSpan))
+        setWindow(offset: selection.0, span: selection.1)
+    }
+    private func zoomBack() {
+        guard let previous = zoomHistory.popLast() else { return }
+        setWindow(offset: previous.0, span: previous.1)
+    }
+    private func showWholeSession() {
+        if visibleSpan > 0 { zoomHistory.append((visibleOffset, visibleSpan)) }
+        setWindow(offset: 0, span: 0)
+    }
+    private var plotRange: ClosedRange<Date> { windowStart...max(windowStart.addingTimeInterval(0.001), windowEnd) }
+    private func interactive<Content: View>(_ content: Content) -> some View {
+        InteractiveSessionPlot(content: content, onSelect: zoomSelection, onBack: zoomBack, onWhole: showWholeSession, canBack: !zoomHistory.isEmpty)
     }
     @ViewBuilder private var selectedChart: some View {
         switch chart {
         case .rr:
             VStack(alignment: .leading, spacing: 7) {
                 HStack { Text("R–R intervals").font(.system(size: 15, weight: .semibold)); Spacer(); Text("\(detail.rr.count.formatted()) intervals · ms").font(.system(size: 12)).foregroundStyle(.secondary) }
-                SessionRRPlot(points: detail.rr, events: detail.events, zone: detail.summary.timeZone).frame(height: 260)
+                interactive(SessionRRPlot(points: detail.rr.filter { inWindow($0.time) }, events: detail.events.filter { inWindow($0.time) }, zone: detail.summary.timeZone, range: plotRange)).frame(height: 260)
             }
         case .ecg:
             VStack(alignment: .leading, spacing: 7) {
-                HStack { Text("ECG waveform").font(.system(size: 15, weight: .semibold)); Spacer(); Text("\(detail.ecg.count.formatted()) plotted samples · mV").font(.system(size: 12)).foregroundStyle(.secondary) }
-                SessionECGPlot(points: detail.ecg, zone: detail.summary.timeZone).frame(height: 300)
-                Text("Long recordings are downsampled for display; source ECG CSV files remain unchanged.").font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack { Text("ECG").font(.system(size: 15, weight: .semibold)); Spacer(); Text(visibleSpan > 0 && visibleSpan <= 30 ? "Full-resolution samples" : "Downsampled overview").font(.system(size: 12)).foregroundStyle(.secondary) }
+                if let ecgError { Text(ecgError).foregroundStyle(PAPStyle.red).font(.system(size: 12)) }
+                if ecgLoading { Text("Loading ECG samples…").foregroundStyle(.secondary) }
+                else if visibleSpan > 0 && visibleSpan <= 30 {
+                    interactive(SessionECGPlot(points: ecgWindowStart == windowStart ? ecgWindow : [], zone: detail.summary.timeZone, range: plotRange)).frame(height: 300)
+                } else {
+                    interactive(SessionECGPlot(points: detail.ecg.filter { inWindow($0.time) }, zone: detail.summary.timeZone, range: plotRange)).frame(height: 300)
+                }
+                Text("Zoom to 30 seconds or less to inspect original ECG samples. Longer ranges are downsampled and cannot reliably show individual beats; spikes may affect the scale.").font(.system(size: 11)).foregroundStyle(.secondary)
             }
         case .pulseRate:
             VStack(alignment: .leading, spacing: 7) {
                 HStack { Text("Pulse Rate").font(.system(size: 15, weight: .semibold)); Spacer(); Text("\(detail.pulseRate.count.formatted()) readings · bpm").font(.system(size: 12)).foregroundStyle(.secondary) }
-                SessionPulsePlot(points: detail.pulseRate, zone: detail.summary.timeZone).frame(height: 260)
+                interactive(SessionPulsePlot(points: detail.pulseRate.filter { inWindow($0.time) }, zone: detail.summary.timeZone, range: plotRange)).frame(height: 260)
             }
         case .hrv:
             VStack(alignment: .leading, spacing: 7) {
                 HStack { Text("HRV trend").font(.system(size: 15, weight: .semibold)); Spacer(); Text("5-minute windows").font(.system(size: 12)).foregroundStyle(.secondary) }
-                SessionHRVPlot(rows: detail.hrv, mode: mode, zone: detail.summary.timeZone).frame(height: 260)
+                HStack { Text(mode == .raw ? "Raw RMSSD · ms" : "Candidate RMSSD · ms").font(.system(size: 12, weight: .medium)); Spacer(); Text(mode == .candidate ? "NN beats not verified" : "Raw intervals").font(.system(size: 11)).foregroundStyle(.secondary) }
+                interactive(SessionHRVPlot(rows: detail.hrv.filter { inWindow($0.start.addingTimeInterval($0.end.timeIntervalSince($0.start) / 2)) }, mode: mode, zone: detail.summary.timeZone, range: plotRange)).frame(height: 260)
+            }
+        }
+    }
+    private func loadECGWindow() {
+        let start = windowStart
+        let duration = visibleSpan
+        let folder = detail.summary.folder
+        let token = requestID
+        ecgLoading = true; ecgError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try SessionStore.ecgWindow(folder: folder, start: start, duration: duration) }
+            DispatchQueue.main.async {
+                guard token == requestID else { return }
+                ecgLoading = false
+                switch result {
+                case .success(let points): ecgWindow = points; ecgWindowStart = start
+                case .failure(let error): ecgError = "Could not load ECG: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -423,19 +531,67 @@ private struct SessionOverview: View {
     private func tableCell(_ value:String)->some View{Text(value).font(.system(size:12)).frame(maxWidth:.infinity,alignment:.leading).padding(.horizontal,9)}
 }
 
+private struct InteractiveSessionPlot<Content: View>: View {
+    let content: Content
+    let onSelect: (Double, Double) -> Void
+    let onBack: () -> Void
+    let onWhole: () -> Void
+    let canBack: Bool
+    @PolarPlotState private var dragStart: CGFloat?
+    @PolarPlotState private var dragEnd: CGFloat?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = max(1, geometry.size.width - 69)
+            content
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .overlay(alignment: .topLeading) {
+                    ZStack(alignment: .topLeading) {
+                        Rectangle().fill(Color.clear).contentShape(Rectangle())
+                        if let start = dragStart, let end = dragEnd {
+                            Rectangle().fill(PAPStyle.blue.opacity(0.22))
+                                .frame(width: abs(end - start))
+                                .offset(x: min(start, end))
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .frame(width: width, height: max(1, geometry.size.height - 40))
+                    .offset(x: 54, y: 12)
+                    .gesture(DragGesture(minimumDistance: 4)
+                        .onChanged { value in
+                            dragStart = max(0, min(width, value.startLocation.x))
+                            dragEnd = max(0, min(width, value.location.x))
+                        }
+                        .onEnded { value in
+                            let a = max(0, min(width, value.startLocation.x))
+                            let b = max(0, min(width, value.location.x))
+                            dragStart = nil; dragEnd = nil
+                            if abs(a - b) >= 4 { onSelect(Double(min(a,b) / width), Double(max(a,b) / width)) }
+                        })
+                    .contextMenu {
+                        Button("Whole session", action: onWhole)
+                        Button("Back to previous zoom", action: onBack).disabled(!canBack)
+                    }
+                }
+        }
+    }
+}
+
 private struct SessionRRPlot: View {
     let points: [SessionRRPoint]
     let events: [SessionEventItem]
     let zone: String
+    let range: ClosedRange<Date>
     var body: some View {
         Canvas { context, size in
-            guard points.count > 1, let first = points.first, let last = points.last, last.time > first.time else {
+            guard points.count > 1 else {
                 context.draw(Text("No R–R data available").font(.system(size:13)).foregroundColor(.secondary), at: CGPoint(x:size.width/2,y:size.height/2)); return
             }
-            let left: CGFloat = 52, right: CGFloat = 12, top: CGFloat = 12, bottom: CGFloat = 28
+            let first = range.lowerBound, last = range.upperBound
+            let left: CGFloat = 54, right: CGFloat = 15, top: CGFloat = 12, bottom: CGFloat = 28
             let width=size.width-left-right, height=size.height-top-bottom
-            let minValue=max(250,(points.map(\.milliseconds).min() ?? 500)-100)
-            let maxValue=min(2500,(points.map(\.milliseconds).max() ?? 1500)+100)
+            let minValue=(points.map(\.milliseconds).min() ?? 500)-100
+            let maxValue=(points.map(\.milliseconds).max() ?? 1500)+100
             let lo=floor(minValue/100)*100, hi=ceil(maxValue/100)*100
             for i in 0...4 {
                 let y=top+height*CGFloat(i)/4
@@ -448,17 +604,17 @@ private struct SessionRRPlot: View {
                 let x=left+width*CGFloat(i)/6
                 var line=Path();line.move(to:CGPoint(x:x,y:top));line.addLine(to:CGPoint(x:x,y:top+height))
                 context.stroke(line,with:.color(PAPStyle.divider.opacity(0.6)),lineWidth:0.6)
-                let t=first.time.addingTimeInterval(last.time.timeIntervalSince(first.time)*Double(i)/6)
+                let t=first.addingTimeInterval(last.timeIntervalSince(first)*Double(i)/6)
                 context.draw(Text(dateText(t,zone:zone,includeDate:false)).font(.system(size:9)).foregroundColor(.secondary),at:CGPoint(x:x,y:size.height-8))
             }
             for event in events where event.name == "disconnected" {
-                let x=left+width*CGFloat(event.time.timeIntervalSince(first.time)/last.time.timeIntervalSince(first.time))
+                let x=left+width*CGFloat(event.time.timeIntervalSince(first)/last.timeIntervalSince(first))
                 var marker=Path();marker.move(to:CGPoint(x:x,y:top));marker.addLine(to:CGPoint(x:x,y:top+height))
                 context.stroke(marker,with:.color(PAPStyle.orange),style:StrokeStyle(lineWidth:1.2,dash:[4,4]))
             }
             var path=Path();var previous:Date?
             for point in points {
-                let x=left+width*CGFloat(point.time.timeIntervalSince(first.time)/last.time.timeIntervalSince(first.time))
+                let x=left+width*CGFloat(point.time.timeIntervalSince(first)/last.timeIntervalSince(first))
                 let y=top+height*CGFloat((hi-point.milliseconds)/(hi-lo))
                 if let previous, point.time.timeIntervalSince(previous)>3 { path.move(to:CGPoint(x:x,y:y)) }
                 else if previous == nil { path.move(to:CGPoint(x:x,y:y)) }
@@ -477,11 +633,15 @@ private struct TimeSeriesPlot: View {
     let color: Color
     let fixedRange: ClosedRange<Double>?
     let showPoints: Bool
+    var maxGap: TimeInterval = 3
+    let range: ClosedRange<Date>
     var body: some View {
         Canvas { context, size in
-            guard values.count > 1, let first = values.first?.0, let last = values.last?.0, last > first else {
+            guard !values.isEmpty else {
                 context.draw(Text("No data available for this signal").font(.system(size: 13)).foregroundColor(.secondary), at: CGPoint(x: size.width / 2, y: size.height / 2)); return
             }
+            let first = range.lowerBound, last = range.upperBound
+            guard last > first else { return }
             let left: CGFloat = 54, right: CGFloat = 15, top: CGFloat = 12, bottom: CGFloat = 28
             let width = max(1, size.width - left - right), height = max(1, size.height - top - bottom)
             let numericValues = values.map { $0.1 }
@@ -509,11 +669,18 @@ private struct TimeSeriesPlot: View {
             for (time, value) in values {
                 let x = left + width * CGFloat(time.timeIntervalSince(first) / last.timeIntervalSince(first))
                 let y = top + height * CGFloat((high - value) / span)
-                if prior == nil || time.timeIntervalSince(prior!) > 3 { path.move(to: CGPoint(x: x, y: y)) }
+                if prior == nil || time.timeIntervalSince(prior!) > maxGap || time <= prior! { path.move(to: CGPoint(x: x, y: y)) }
                 else { path.addLine(to: CGPoint(x: x, y: y)) }
                 prior = time
             }
             context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: showPoints ? 1.7 : 1.2, lineCap: .round, lineJoin: .round))
+            if showPoints {
+                for (time, value) in values {
+                    let x = left + width * CGFloat(time.timeIntervalSince(first) / last.timeIntervalSince(first))
+                    let y = top + height * CGFloat((high - value) / span)
+                    context.fill(Path(ellipseIn: CGRect(x: x - 2, y: y - 2, width: 4, height: 4)), with: .color(color))
+                }
+            }
             context.draw(Text(unit).font(.system(size: 10)).foregroundColor(.secondary), at: CGPoint(x: left - 22, y: top - 2))
         }
     }
@@ -522,16 +689,18 @@ private struct TimeSeriesPlot: View {
 private struct SessionECGPlot: View {
     let points: [SessionECGPoint]
     let zone: String
+    let range: ClosedRange<Date>
     var body: some View {
-        TimeSeriesPlot(values: points.map { ($0.time, $0.millivolts) }, zone: zone, unit: "mV", color: PAPStyle.blue, fixedRange: nil, showPoints: false)
+        TimeSeriesPlot(values: points.map { ($0.time, $0.millivolts) }, zone: zone, unit: "mV", color: PAPStyle.blue, fixedRange: nil, showPoints: false, range: range)
     }
 }
 
 private struct SessionPulsePlot: View {
     let points: [SessionPulsePoint]
     let zone: String
+    let range: ClosedRange<Date>
     var body: some View {
-        TimeSeriesPlot(values: points.map { ($0.time, $0.bpm) }, zone: zone, unit: "bpm", color: PAPStyle.green, fixedRange: nil, showPoints: true)
+        TimeSeriesPlot(values: points.map { ($0.time, $0.bpm) }, zone: zone, unit: "bpm", color: PAPStyle.green, fixedRange: nil, showPoints: false, range: range)
     }
 }
 
@@ -539,16 +708,14 @@ private struct SessionHRVPlot: View {
     let rows: [SessionHRVRow]
     let mode: HRVDisplayMode
     let zone: String
+    let range: ClosedRange<Date>
     var body: some View {
         let values = rows.compactMap { row -> (Date, Double)? in
             let value = mode == .raw ? row.rmssd : row.candidateRMSSD
             guard let value else { return nil }
             return (row.start.addingTimeInterval(row.end.timeIntervalSince(row.start) / 2), value)
         }
-        VStack(alignment: .leading, spacing: 4) {
-            HStack { Text(mode == .raw ? "Raw RMSSD · ms" : "Candidate RMSSD · ms").font(.system(size: 12, weight: .medium)); Spacer(); Text(mode == .candidate ? "NN beats not verified" : "Raw intervals").font(.system(size: 11)).foregroundStyle(.secondary) }
-            TimeSeriesPlot(values: values, zone: zone, unit: "ms", color: PAPStyle.orange, fixedRange: nil, showPoints: true)
-        }
+        TimeSeriesPlot(values: values, zone: zone, unit: "ms", color: PAPStyle.orange, fixedRange: nil, showPoints: true, maxGap: 450, range: range)
     }
 }
 
