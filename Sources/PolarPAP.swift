@@ -43,6 +43,7 @@ final class Recorder: NSObject, ObservableObject, CBCentralManagerDelegate, CBPe
     @Published var timeShiftOutput: URL?
     @Published var timeShiftMessage: String?
     @Published var timeShiftBusy = false
+    @Published var timeShiftDropBackwardRR = false
     @Published var page: AppPage = .record
     @Published var sessionsRoot: URL?
     @Published var sessions: [SavedSession] = []
@@ -434,11 +435,12 @@ final class Recorder: NSObject, ObservableObject, CBCentralManagerDelegate, CBPe
         guard let source = timeShiftFolder else { return }
         guard timeShiftTargetTextValid else { timeShiftMessage = "Enter a valid date and time in DD/MM/YYYY, HH:MM:SS format."; return }
         let target = timeShiftTargetStart
+        let filterRR = timeShiftDropBackwardRR
         timeShiftBusy = true; timeShiftMessage = "Creating a shifted copy…"; timeShiftOutput = nil
         Task { @MainActor [weak self] in
             do {
                 let output = try await Task.detached(priority: .userInitiated) {
-                    try TimeShiftProcessor.createShiftedCopy(source: source, targetStart: target)
+                    try TimeShiftProcessor.createShiftedCopy(source: source, targetStart: target, dropBackwardRR: filterRR)
                 }.value
                 self?.timeShiftOutput = output
                 self?.timeShiftMessage = "Shifted copy created. The source session is unchanged."

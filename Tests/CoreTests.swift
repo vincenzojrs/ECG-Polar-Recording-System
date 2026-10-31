@@ -90,6 +90,20 @@ import Foundation
         check(shiftedRR.contains("1700003600000000000,2023-11-14T23:13:20.000Z") && shiftedRR.contains("candidate_only_not_verified_NN"), "end-to-end shift updates timestamps and keeps data fields")
         let shiftedEvents = try String(contentsOf: shiftedFolder.appendingPathComponent("000_events.csv"), encoding: .utf8)
         check(shiftedEvents.contains("\"quoted, detail\""), "streamed time shift preserves quoted commas")
+        // The optional export filter compares across rotated files and preserves source rows.
+        let rrHeader = SessionWriter.headers["rr"]!
+        let rr = { (t: Int64) in "\(t),time,1024,1000,80,\(t),true,true,test,1,test\n" }
+        let rawRR = rrHeader + "\n" + rr(testStart + 2_000_000_000) + rr(testStart + 1_000_000_000)
+        try rawRR.write(to: sourceFolder.appendingPathComponent("000_rr.csv"), atomically: true, encoding: .utf8)
+        try (rrHeader + "\n" + rr(testStart + 1_500_000_000) + rr(testStart + 3_000_000_000)).write(to: sourceFolder.appendingPathComponent("001_rr.csv"), atomically: true, encoding: .utf8)
+        let filteredFolder = try TimeShiftProcessor.createShiftedCopy(source: sourceFolder, targetStart: Date(timeIntervalSince1970: 1_700_003_600), dropBackwardRR: true)
+        let filteredMeta = try JSONSerialization.jsonObject(with: Data(contentsOf: filteredFolder.appendingPathComponent("session.json"))) as! [String: Any]
+        let filterInfo = filteredMeta["rr_timestamp_filter"] as? [String: Any]
+        check(filterInfo?["dropped_rows"] as? Int == 2, "RR filter counts backwards rows across rotated files")
+        let sourceAfterFilter = try String(contentsOf: sourceFolder.appendingPathComponent("000_rr.csv"), encoding: .utf8)
+        check(sourceAfterFilter == rawRR, "RR filter preserves original source")
+        let filteredSecond = try String(contentsOf: filteredFolder.appendingPathComponent("001_rr.csv"), encoding: .utf8)
+        check(filteredSecond.split(separator: "\n").count == 2, "RR filter keeps only ordered rows")
         var timeline = ECGTimeline()
         let first = timeline.map(frame, receiptNS: receipt, frozen: false)
         check(first.unix.last == receipt, "frame endpoint anchor")
