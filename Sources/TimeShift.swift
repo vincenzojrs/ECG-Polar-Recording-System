@@ -33,7 +33,7 @@ enum TimeShiftProcessor {
         return result
     }
 
-    static func createShiftedCopy(source: URL, targetStart: Date) throws -> URL {
+    static func createShiftedCopy(source: URL, targetStart: Date, dropBackwardRR: Bool = false) throws -> URL {
         let fm = FileManager.default
         let metadataURL = source.appendingPathComponent("session.json")
         guard let metadataData = try? Data(contentsOf: metadataURL),
@@ -45,10 +45,11 @@ enum TimeShiftProcessor {
         guard (metadata["status"] as? String) == "completed" else {
             throw TimeShiftError.invalid("Only completed sessions can be shifted. Stop or recover the recording first.")
         }
-        let targetNS = Int64((targetStart.timeIntervalSince1970 * 1e9).rounded())
+        let originalDate = Date(timeIntervalSince1970: Double(sourceStart) / 1e9)
+        let targetNS = targetStart == originalDate ? sourceStart : Int64((targetStart.timeIntervalSince1970 * 1e9).rounded())
         let (deltaNS, overflow) = targetNS.subtractingReportingOverflow(sourceStart)
         guard !overflow else { throw TimeShiftError.invalid("The requested time shift is outside the supported range.") }
-        guard deltaNS != 0 else { throw TimeShiftError.invalid("The selected start time matches the original session time.") }
+        guard deltaNS != 0 || dropBackwardRR else { throw TimeShiftError.invalid("The selected start time matches the original session time.") }
 
         let parent = source.deletingLastPathComponent()
         let local = DateFormatter(); local.locale = Locale(identifier: "en_US_POSIX"); local.timeZone = .current; local.dateFormat = "yyyy-MM-dd_HHmmss"
@@ -64,14 +65,16 @@ enum TimeShiftProcessor {
             let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; formatter.timeZone = TimeZone(secondsFromGMT: 0)
             let contents = try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
             var csvCount = 0
-            for file in contents {
+            var lastAcceptedRR: Int64? = nil
+            var droppedRR = 0
+            for file in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 let name = file.lastPathComponent
                 if name == "session.json" { continue }
                 if file.pathExtension.lowercased() == "csv" {
                     let stem = file.deletingPathExtension().lastPathComponent
                     let kind = stem.split(separator: "_").dropFirst().joined(separator: "_")
                     guard csvNames.contains(kind) else { continue }
-                    try transformCSVFile(file, to: staging.appendingPathComponent(name), deltaNS: deltaNS, formatter: formatter)
+                    try transformCSVFile(file, to: staging.appendingPathComponent(name), deltaNS: deltaNS, formatter: formatter, filterRR: dropBackwardRR && kind == "rr", lastAcceptedRR: &lastAcceptedRR, droppedRR: &droppedRR)
                     csvCount += 1
                 }
             }
@@ -96,15 +99,20 @@ enum TimeShiftProcessor {
                 return value
             }
             guard var adjusted = try shiftMetadataTimes(metadata) as? [String: Any] else { throw TimeShiftError.invalid("Cannot update session metadata.") }
-            adjusted["time_shift_applied"] = true
-            adjusted["time_shift_tool_version"] = "0.1.4"
-            adjusted["time_shift_source_start_unix_ns"] = String(sourceStart)
-            adjusted["time_shift_target_start_unix_ns"] = String(targetNS)
-            adjusted["time_shift_offset_ns"] = String(deltaNS)
-            adjusted["time_shift_created_at_unix_ns"] = String(Int64((Date().timeIntervalSince1970 * 1e9).rounded()))
-            if let oldTimeZone { adjusted["time_shift_source_time_zone"] = oldTimeZone }
-            adjusted["time_zone"] = TimeZone.current.identifier
-            adjusted["utc_offset_at_start_s"] = TimeZone.current.secondsFromGMT(for: targetStart)
+            if dropBackwardRR {
+                adjusted["rr_timestamp_filter"] = ["method": "drop_before_last_accepted_v1", "dropped_rows": droppedRR, "hrv_source": "original_unfiltered_rr", "original_files_preserved": true] as [String : Any]
+            }
+            if deltaNS != 0 {
+                adjusted["time_shift_applied"] = true
+                adjusted["time_shift_tool_version"] = "0.1.4"
+                adjusted["time_shift_source_start_unix_ns"] = String(sourceStart)
+                adjusted["time_shift_target_start_unix_ns"] = String(targetNS)
+                adjusted["time_shift_offset_ns"] = String(deltaNS)
+                adjusted["time_shift_created_at_unix_ns"] = String(Int64((Date().timeIntervalSince1970 * 1e9).rounded()))
+                if let oldTimeZone { adjusted["time_shift_source_time_zone"] = oldTimeZone }
+                adjusted["time_zone"] = TimeZone.current.identifier
+                adjusted["utc_offset_at_start_s"] = TimeZone.current.secondsFromGMT(for: targetStart)
+            }
             let outputMetadata = try JSONSerialization.data(withJSONObject: adjusted, options: [.prettyPrinted, .sortedKeys])
             try outputMetadata.write(to: staging.appendingPathComponent("session.json"), options: .atomic)
             try fm.moveItem(at: staging, to: final)
@@ -116,7 +124,9 @@ enum TimeShiftProcessor {
     }
 
     private static func transformCSVFile(_ source: URL, to destination: URL, deltaNS: Int64,
-                                         formatter: ISO8601DateFormatter) throws {
+                                         formatter: ISO8601DateFormatter, filterRR: Bool, lastAcceptedRR: inout Int64?, droppedRR: inout Int) throws {
+        var localLast = lastAcceptedRR
+        var localDropped = droppedRR
         let input = try FileHandle(forReadingFrom: source)
         guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
             try? input.close(); throw TimeShiftError.invalid("Cannot create output file \(destination.lastPathComponent).")
@@ -156,6 +166,13 @@ enum TimeShiftProcessor {
                 outputBuffer.append(encode(headers))
             } else {
                 let shiftedValues = try shifted(values, headers: headers, deltaNS: deltaNS, utcFormatter: formatter)
+                if filterRR {
+                    guard let index = headers.firstIndex(of: "timestamp_unix_ns"), let timestamp = Int64(shiftedValues[index]) else {
+                        throw TimeShiftError.invalid("Invalid R–R timestamp in \(source.lastPathComponent).")
+                    }
+                    if let last = localLast, timestamp < last { localDropped += 1; return }
+                    localLast = timestamp
+                }
                 outputBuffer.append(encode(shiftedValues))
             }
             if outputBuffer.count >= 65_536 { try output.write(contentsOf: outputBuffer); outputBuffer.removeAll(keepingCapacity: true) }
@@ -194,5 +211,7 @@ enum TimeShiftProcessor {
         guard !headers.isEmpty else { throw TimeShiftError.invalid("No CSV header found in \(source.lastPathComponent).") }
         if !outputBuffer.isEmpty { try output.write(contentsOf: outputBuffer) }
         try output.synchronize()
+        lastAcceptedRR = localLast
+        droppedRR = localDropped
     }
 }

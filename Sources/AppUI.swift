@@ -787,6 +787,8 @@ private struct ShiftPage: View {
                 Divider()
                 VStack(alignment:.leading,spacing:12){Text("Preview").font(.system(size:17,weight:.semibold));previewTable}
                 VStack(alignment:.leading,spacing:7){Label("All absolute timestamps and UTC columns shift together.",systemImage:"checkmark.circle.fill").foregroundStyle(PAPStyle.green);Label("Signal values, Polar relative time, and monotonic time stay unchanged.",systemImage:"checkmark.circle.fill").foregroundStyle(PAPStyle.green)}.font(.system(size:13))
+                Toggle("Exclude R–R rows with backward timestamps", isOn: $r.timeShiftDropBackwardRR)
+                Text("The original session is preserved. The export records the number of excluded R–R rows; existing HRV values remain calculated from the original recording.").font(.system(size:12)).foregroundStyle(.secondary)
                 Divider()
                 VStack(alignment:.leading,spacing:5){Text("New folder").font(.system(size:16,weight:.semibold));Text(folderName).font(.system(size:13,design:.monospaced)).padding(9).frame(maxWidth:.infinity,alignment:.leading).background(PAPStyle.card,in:RoundedRectangle(cornerRadius:7)).overlay(RoundedRectangle(cornerRadius:7).stroke(PAPStyle.divider,lineWidth:0.7));Text("Saved beside the source. Original files stay unchanged.").font(.system(size:12)).foregroundStyle(.secondary)}
                 HStack { Text("This aligns the data timeline; it does not synchronize devices.").font(.system(size:12)).foregroundStyle(.secondary);Spacer();Button(r.timeShiftBusy ? "Creating copy…" : "Create shifted copy"){r.createShiftedCopy()}.buttonStyle(.borderedProminent).disabled(r.timeShiftFolder == nil || r.timeShiftBusy || r.recording || !r.timeShiftTargetTextValid) }
